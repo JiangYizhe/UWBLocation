@@ -1,0 +1,13 @@
+{
+  "configurations": [{
+    "name": "Debug Serial",
+    "type": "cppdbg",
+    "request": "launch",
+    "program": "${fileDirname}/${fileBasenameNoExtension}",
+    "args": [],
+    "stopAtEntry": false,
+    "cwd": "${workspaceFolder}",
+    "environment": [],
+    "externalConsole": false
+  }]
+}

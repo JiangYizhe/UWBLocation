@@ -1,0 +1,315 @@
+#include <iostream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <vector>
+#include <thread>
+#include <cmath>
+#include <Eigen/Dense>
+#include <mutex>
+#include <string>
+#include <atomic>
+#include <cstring>  // 添加memset头文件
+#include <cerrno>   // 添加errno头文件
+
+using namespace Eigen;
+
+// 点结构体定义
+typedef struct 
+{
+    double x, y, z;
+} Point;
+
+// 距离计算函数
+double distance(const Point& a, const Point& b) 
+{
+    return (Vector3d(a.x,a.y,a.z)-Vector3d(b.x,b.y,b.z)).norm();
+}
+
+// 初始猜测函数
+Point initial_guess(Point points[4], double distances[4]) 
+{
+    Vector3d ref(points[0].x, points[0].y, points[0].z);
+    Matrix3d A;
+    Vector3d B;
+    for(int i=0; i<3; i++) 
+    {
+        Vector3d p(points[i+1].x, points[i+1].y, points[i+1].z);
+        A.row(i) = 2*(p - ref);
+        double ref_sq = ref.squaredNorm();
+        double p_sq = p.squaredNorm();
+        B[i] = distances[0]*distances[0] - distances[i+1]*distances[i+1] - ref_sq + p_sq;
+    }
+    Vector3d X = A.colPivHouseholderQr().solve(B);
+    return {X[0], X[1], X[2]};
+}
+
+// 优化函数
+Point optimize(Point points[4], double distances[4], Point initial) 
+{
+    Vector3d X(initial.x, initial.y, initial.z);
+    double lambda = 0.001;
+    double prev_error = 1e20;
+    
+    for(int iter=0; iter<100; iter++) 
+    {
+        Matrix<double,4,3> J;
+        Vector4d residuals;
+        double error = 0;
+        
+        for(int i=0; i<4; i++) 
+        {
+            Vector3d p(points[i].x, points[i].y, points[i].z);
+            double d = (X - p).norm();
+            double diff = d - distances[i];
+            residuals[i] = diff;
+            error += diff * diff;
+            
+            if(d < 1e-12) d = 1e-12;  // 防止除零错误
+            J.row(i) = (X - p).transpose() / d;
+        }
+        
+        if(std::abs(prev_error - error) < 1e-6) break;
+        prev_error = error;
+        
+        Matrix3d H = J.transpose() * J;
+        H.diagonal() *= (1.0 + lambda);
+        Vector3d g = J.transpose() * residuals;
+        Vector3d delta = H.colPivHouseholderQr().solve(-g);
+        Vector3d X_new = X + delta;
+        
+        double new_error = 0;
+        for(int i=0; i<4; i++) 
+        {
+            Vector3d p(points[i].x, points[i].y, points[i].z);
+            new_error += std::pow((X_new - p).norm() - distances[i], 2);
+        }
+        
+        if(new_error < error) 
+        {
+            X = X_new;
+            lambda /= 10.0;
+        } 
+        else 
+        {
+            lambda *= 10.0;
+        }
+    }
+    return {X[0], X[1], X[2]};
+}
+
+// 获取点函数
+Point get_point(Point points[4], double distances[4]) 
+{
+    Point initial = initial_guess(points, distances);
+    return optimize(points, distances, initial);  // 启用优化
+}
+
+class SerialPort {
+private:
+    int fd = -1;
+    const size_t PACKET_SIZE = 16;
+    std::mutex port_mutex;
+
+public:
+    ~SerialPort() {
+        close();
+    }
+
+    bool open(const char* device, speed_t baudrate) {
+        std::lock_guard<std::mutex> lock(port_mutex);
+        if(fd >= 0) close();  // 防止重复打开
+        
+        fd = ::open(device, O_RDWR | O_NOCTTY | O_NDELAY);
+        if(fd < 0) {
+            perror(("打开串口 " + std::string(device) + " 失败").c_str());
+            return false;
+        }
+
+        // 恢复串口为阻塞模式
+        fcntl(fd, F_SETFL, 0);
+
+        struct termios options;
+        if(tcgetattr(fd, &options) != 0) {
+            perror("获取串口属性失败");
+            return false;
+        }
+
+        // 设置波特率
+        cfsetispeed(&options, baudrate);
+        cfsetospeed(&options, baudrate);
+
+        // 8位数据位，无校验，1停止位
+        options.c_cflag &= ~PARENB;
+        options.c_cflag &= ~CSTOPB;
+        options.c_cflag &= ~CSIZE;
+        options.c_cflag |= CS8;
+        options.c_cflag |= (CLOCAL | CREAD);
+
+        // 关闭流控
+        options.c_cflag &= ~CRTSCTS;
+        options.c_iflag &= ~(IXON | IXOFF | IXANY);
+
+        // 原始输入输出模式
+        options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+        options.c_oflag &= ~OPOST;
+
+        // 控制字符设置
+        options.c_cc[VMIN] = 0;   // 非阻塞读取（最少0字节）
+        options.c_cc[VTIME] = 10; // 1秒超时（0.1秒单位）
+
+        if(tcsetattr(fd, TCSANOW, &options) != 0) {
+            perror("设置串口参数失败");
+            return false;
+        }
+
+        // 清空输入输出缓冲区
+        tcflush(fd, TCIOFLUSH);
+        return true;
+    }
+
+    bool write(const std::vector<uint8_t>& data) {
+        std::lock_guard<std::mutex> lock(port_mutex);
+        if(fd < 0) return false;
+
+        size_t total_sent = 0;
+        while(total_sent < data.size()) {
+            ssize_t bytes_sent = ::write(fd, data.data() + total_sent, data.size() - total_sent);
+            if(bytes_sent < 0) {
+                if(errno == EINTR) continue;  // 处理中断
+                perror("串口写入失败");
+                return false;
+            }
+            total_sent += bytes_sent;
+        }
+        return true;
+    }
+
+    std::vector<uint8_t> read() {
+        std::lock_guard<std::mutex> lock(port_mutex);
+        if(fd < 0) return {};
+
+        std::vector<uint8_t> buffer(256);
+        ssize_t len = ::read(fd, buffer.data(), buffer.size());
+        
+        if(len > 0) {
+            buffer.resize(len);
+            return buffer;
+        } else if(len == 0) {
+            return {};  // 无数据（通常不会发生）
+        } else {
+            if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                return {};  // 非阻塞模式下无数据
+            } else {
+                perror(("串口读取失败，errno=" + std::to_string(errno)).c_str());
+                return {};
+            }
+        }
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lock(port_mutex);
+        if(fd >= 0) {
+            ::close(fd);
+            fd = -1;
+        }
+    }
+};
+
+int main() {
+    SerialPort recv_port;
+    SerialPort send_port;
+    
+    // 打开串口（根据实际设备调整路径）
+    if(!recv_port.open("/dev/ttyS0", B115200)) {
+        std::cerr << "接收串口打开失败" << std::endl;
+        return 1;
+    }
+    
+    if(!send_port.open("/dev/ttyS7", B115200)) {
+        std::cerr << "发送串口打开失败" << std::endl;
+        recv_port.close();
+        return 1;
+    }
+    
+    std::cout << "串口初始化完成，开始处理数据..." << std::endl;
+    
+    std::vector<uint8_t> recv_buffer;  // 接收缓冲区
+    const size_t PACKET_SIZE = 16;     // 数据包固定大小
+
+    while(true) {
+        auto data = recv_port.read();
+        if(!data.empty()) {
+            // 合并到接收缓冲区
+            recv_buffer.insert(recv_buffer.end(), data.begin(), data.end());
+
+            // 处理完整数据包
+            while(recv_buffer.size() >= PACKET_SIZE) {
+                // 提取数据包
+                std::vector<uint8_t> packet(recv_buffer.begin(), recv_buffer.begin() + PACKET_SIZE);
+                recv_buffer.erase(recv_buffer.begin(), recv_buffer.begin() + PACKET_SIZE);
+
+                // 示例：验证包头（根据实际协议修改）
+                // if(packet[0] != 0xEB || packet[1] != 0x90) {
+                //     std::cerr << "无效包头，跳过" << std::endl;
+                //     continue;
+                // }
+
+                // 提取距离数据（假设从第6字节开始，每2字节为一个uint16_t）
+                std::vector<double> distances;
+                for(size_t j=6; j+1 < packet.size(); j+=2) {
+                    if(j+1 >= packet.size()) break;
+                    uint16_t value = (static_cast<uint16_t>(packet[j]) << 8) | packet[j+1];
+                    distances.push_back(static_cast<double>(value));
+                }
+
+                // 检查距离数据有效性
+                if(distances.size() != 4) {
+                    std::cerr << "无效距离数据，需要4个值，实际获取" << distances.size() << std::endl;
+                    continue;
+                }
+
+                // 锚点坐标（根据实际部署修改）
+                Point anchors[4] = {{0,0,0}, {168,0,0}, {0,186,0}, {168,186,0}};
+                
+                // 解算坐标（启用优化）
+                Point result = get_point(anchors, distances.data());
+
+                // 准备发送数据（示例：发送double类型的二进制数据，小端格式）
+                std::vector<uint8_t> send_data;
+                auto append_double = [&](double value) {
+                    uint64_t temp;
+                    std::memcpy(&temp, &value, sizeof(double));
+                    for(int i=0; i<8; i++) {
+                        send_data.push_back(static_cast<uint8_t>((temp >> (i*8)) & 0xFF));
+                    }
+                };
+                append_double(result.x);
+                append_double(result.y);
+                append_double(result.z);
+
+                // 添加校验和（简单异或）
+                uint8_t checksum = 0;
+                for(uint8_t byte : send_data) checksum ^= byte;
+                send_data.push_back(checksum);
+
+                // 发送数据
+                if(send_port.write(send_data)) {
+                    std::cout << "发送成功 | 坐标: (" 
+                              << result.x << ", " << result.y << ", " << result.z << ")" << std::endl;
+                } else {
+                    std::cerr << "发送失败 | 坐标: (" 
+                              << result.x << ", " << result.y << ", " << result.z << ")" << std::endl;
+                }
+            }
+        }
+
+        // 短暂休眠降低CPU占用
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // 理论上不会执行到这里
+    recv_port.close();
+    send_port.close();
+    return 0;
+}

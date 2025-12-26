@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [{
+    "label": "build",
+    "type": "shell",
+    "command": "g++",
+    "args": [
+      "${file}",
+      "-o", "${fileDirname}/${fileBasenameNoExtension}",
+      "-lserial",  // 链接串口库:ml-citation{ref="8" data="citationList"}
+      "-Wall"
+    ],
+    "group": { "kind": "build", "isDefault": true }
+  }]
+}
